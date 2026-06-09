@@ -4,8 +4,15 @@
 > **JSON-RPC over WebSocket(`/api/ws`)**,修复掉线 / 重连失败 / 延迟高 / 消息乱序 /
 > 回复不可见 / 401 风暴,并大幅降低对 Hermes-CN-Core 的上游 sync 负担。
 >
-> 分支:`claude/gateway-connection-overhaul`(worktree:`.claude/worktrees/gateway-connection-overhaul`,基线 `main@23ab09a`)
+> 分支:`claude/gateway-connection-overhaul-v2`(worktree:`.claude/worktrees/gateway-connection-overhaul-v2`,**基线 `origin/main` v0.3.2**)
 > 本文件是**活文档**,每完成一步就更新「进度跟踪」表与「变更记录」。
+
+> ⚠️ **基线对齐(2026-06-09 晚)**:最初的 `claude/gateway-connection-overhaul` 误从过期本地 `main@23ab09a` 切出,
+> 落后真实 `origin/main`(v0.3.2)**293 个提交**,已废弃。本 v2 分支重切自最新 `origin/main`,3 个提交(docs/P0-2/P1)
+> 已 cherry-pick 过来并与上游对账。**关键变化**:上游 PR #177「修复 SSE 断线自动重连」(`3b9ab1d`,526 行)已合入 main,
+> 给 SSE 客户端加了指数退避、12s 断线宽限(同 client_id 重连)、唤醒恢复、`intentionalClose`——所以下面「症状→根因」
+> 表里关于 SSE 重连的几条**已被上游修掉**,P0-2 已据此裁剪(见 §1b)。另:`e987f22`(回复可见性)、`ba313b1`(消息乱序)
+> 也已并入 main;只剩 `0dd1206`(配置侧栏冻结)未并。
 
 ---
 
@@ -28,17 +35,34 @@
 
 ### 症状 → 根因映射
 
-| 症状 | 根因(file:line) |
-|---|---|
-| 掉线 / 重连失败 | SSE 一次性流出错即退出(`sse_proxy.rs:159`);前端**平 1s 死循环无退避**(`gateway-sse-client.ts:615`);SSE 路径**无心跳**,睡眠唤醒后半开 socket 不被发现 |
-| 回复要切走再切回才可见 | 重连后**不重发 `session.resume`** + persistent→gateway-id 多对一映射返回最老的死 id(修复 `e987f22` 未合并) |
-| 消息乱序/重复 | 乐观本地消息 + REST 回拉消息客户端合并,**无服务端序号**,需 `createdAt` 重排(修复 `ba313b1` 未合并) |
-| 全链路延迟高 | 每 RPC 经 Rust 代理 + `res.text()` 整包缓冲(`api_proxy.rs:407`);慢 turn 再走 SSE 第二跳(异步 ack);30s/120s 超时错配;单 Mutex 每命令锁两次 |
-| 401 风暴 | dashboard 重启即轮换 token,我们从 HTML 抓 token;401 静默重试 `body.clone()` 重放(`api_proxy.rs:468`) |
-| Token 泄漏 | SSE 端点在 auth 中间件外,token 写进 URL 查询串 |
-| 配置侧栏冻结 (#165) | IPC 代理设计 + StrictMode/raceAbort(修复 `0dd1206` 未合并) |
+> 注:下表是**最初对着旧基线**的分析;⊘ 标记的几条已被上游 #177 / 已合并修复覆盖,见 §1b。
+
+| 症状 | 根因(file:line) | 现状 |
+|---|---|---|
+| 掉线 / 重连失败 | SSE 一次性流出错即退出;前端平 1s 死循环无退避;SSE 路径无心跳 | ⊘ **#177 已修**(退避+12s 宽限+唤醒恢复) |
+| 回复要切走再切回才可见 | 重连后**不重发 `session.resume`** + persistent→gateway-id 多对一映射返回最老的死 id | 映射部分 ⊘(`e987f22` 已并);**重连不重发 resume 仍存在 → P0-2 处理** |
+| 消息乱序/重复 | 乐观本地消息 + REST 回拉消息客户端合并,无服务端序号,需 `createdAt` 重排 | ⊘ `ba313b1` 已并 |
+| 全链路延迟高 | 每 RPC 经 Rust 代理 + `res.text()` 整包缓冲;慢 turn 再走 SSE 第二跳(异步 ack) | 仍存在 → **P1 切 WS 解决** |
+| 401 风暴 | dashboard 重启即轮换 token,从 HTML 抓 token;401 静默重试 `body.clone()` 重放 | 走 WS 后 token 在 Rust 侧,缓解;待 P2 评估 |
+| Token 泄漏 | SSE 端点在 auth 中间件外,token 写进 URL 查询串 | 走 WS 后消失(WS 用 loopback `?token=`);P1 |
+| 配置侧栏冻结 (#165) | IPC 代理设计 + StrictMode/raceAbort | 修复 `0dd1206` **仍未并入 main** → P0-3 待办 |
 
 ---
+
+## 1b. 与上游 #177 对账(重切基线后)
+
+PR #177(`3b9ab1d`)已经把 SSE 客户端从「平 1s 死循环」升级成:指数退避(1→30s)、**12s 断线宽限**
+(宽限内用**同一个 client_id** 重连,期间**不**发 `gateway.disconnected`)、系统唤醒恢复、`intentionalClose`。
+因此:
+
+- **短掉线(< 12s)**:#177 透明恢复,我方无需任何动作。
+- **长掉线 / dashboard 重启 / 会话被回收**:宽限到点才发 `gateway.disconnected`——这正是会把在途 turn 冻结成
+  「连接已断开」的时刻,且**至今没有任何地方在重连后重发 `session.resume`**。这就是 P0-2 仍要补的精确缺口。
+
+**P0-2 据此裁剪**:不再(像旧分支那样)在每次 `open` 都重发 resume(会和 #177 的同 client_id 重连重复);改为
+**只在收到真实的 `gateway.disconnected`(宽限到点)后,arm 一个一次性标志,下次 `open` 时才重发 `session.resume`**
+(`use-gateway.ts` 的 `needsResumeOnReopen`)。同时把该 disconnect 的处理从 `terminateAllStreams`(冻结报错)换成
+`markStreamsReconnecting`(transient「重连中」,保留在途消息);resume 真失败再回退报错。
 
 ## 2. 架构对比(官方 vs 我们 vs 迁移后)
 
@@ -91,10 +115,11 @@
 
 | ID | 任务 | 状态 | 负责 | 备注 |
 |---|---|---|---|---|
-| 设置 | worktree + `claude/` 分支 + 计划文档 | ✅ | claude | 本文件;分支 `claude/gateway-connection-overhaul` |
+| 设置 | worktree + `claude/` 分支 + 计划文档 | ✅ | claude | 本文件;分支 `claude/gateway-connection-overhaul-v2`(重切自 origin/main v0.3.2) |
+| 基线对齐 | 废弃落后 293 commits 的旧分支,重切 + cherry-pick + 与 #177 对账 | ✅ | claude | 见 §1b;typecheck + web 单测 555 全绿 |
 | P0-1 | WS spike(打包态 webview 直连 `/api/ws`) | ✅(被 P1-1 吸收) | claude | 不再是迁移的前置闸门:P1-1 的 auto 协商在运行时**自动探测**,结果即 P0-1 答案(看 `getActiveTransport()` / `HERMES_TRANSPORT_LEARNED`) |
 | P0-2 | 重连后重发 `session.resume`(断开标记重连中) | 🟡 | claude | 代码+单测完成;**运行时验证待用户实测**(睡眠唤醒 / dashboard 重启) |
-| P0-3 | 合并四个修复分支到 main | ⏸ | 用户 | 改 main,需确认后执行;非本 worktree 内改动 |
+| P0-3 | 合并剩余修复分支到 main | 🟡 | 用户 | 4 个里 `e987f22`/`ba313b1` 已并入 v0.3.2;**只剩 `0dd1206` 配置侧栏冻结**待并(SSE token 泄漏走 WS 后即消失) |
 | P1-1 | Tauri 传输翻 WS(WS-first + SSE 自动回退) | 🟡 | claude | 实现+单测(typecheck + 343 web 测试)+ 4 维对抗式审查通过(15 findings → 1 真实潜在缺陷已修);**运行时验证待实测** |
 | P2-1 | 删 SSE 代理 + P-009 客户端 | ⬜ | - | 依赖 P1-1 软化 |
 | P2-2 | Core 退役 P-009 端点 | ⬜ | - | 依赖全量桌面端切 WS |
@@ -189,4 +214,8 @@
   typecheck 三个 workspace 通过;web 单测 335 全绿。运行时验证待用户实测。
 - 2026-06-09 — **P1-1 实现**:Tauri 传输改为 WS-first + SSE 自动回退(`gateway-negotiation.ts`),
   `pickTransport()` 返回 `"auto"`。经 4 维对抗式审查(15 findings → 1 真实潜在缺陷,已加 `intentionalClose`
-  修复)。typecheck 通过;web 单测 343 全绿。运行时验证待用户实测。
+  修复)。typecheck 通过;web 单测 343 全绿(旧基线)。
+- 2026-06-09(晚)— **基线对齐 + 与 #177 对账**:发现旧分支落后 origin/main 293 commits,已废弃;
+  重切 `claude/gateway-connection-overhaul-v2` 自 v0.3.2,cherry-pick 三个提交(仅 `use-gateway.ts` 导入块冲突,已解)。
+  与上游 #177(SSE 退避/12s 宽限/唤醒)对账:P0-2 改为**只在真实 `gateway.disconnected` 后 arm、下次 `open` 重发
+  `session.resume`**(`needsResumeOnReopen`),避免和 #177 同 client_id 重连重复。typecheck 通过;web 单测 **555 全绿**。

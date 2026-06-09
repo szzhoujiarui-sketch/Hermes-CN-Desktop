@@ -122,28 +122,29 @@ function ensureGatewayBridge(): GatewaySubscriptionBridge {
   const client = getGatewayClient();
   client.enableAutoReconnect();
 
-  // Distinguish a first connect from a reconnect by tracking open→…→open
-  // transitions. A reconnect must re-issue session.resume to recover the
-  // in-flight turn (the SSE/WS gateway has no server-side replay buffer).
-  let connectedOnce = false;
-  let lastState: GatewayState = client.state;
+  // Only re-issue session.resume after a *real* disconnect, not on every reopen.
+  // The SSE client already recovers brief drops transparently by reconnecting
+  // with the same client_id inside its grace window (no `gateway.disconnected`
+  // fires), so re-resuming on those reopens would be redundant churn. We arm
+  // this flag when `gateway.disconnected` fires (grace expired / session lost)
+  // and consume it on the next `open`. See docs/gateway-connection-overhaul.md (P0-2).
+  let needsResumeOnReopen = false;
 
   bridge.unsubscribeState = client.onState((state) => {
     forEachSubscriber(bridge, (sub) => sub.setConnectionState(state));
-    if (state === "open") {
-      if (connectedOnce && lastState !== "open") {
-        void reattachActiveSessionAfterReconnect();
-      }
-      connectedOnce = true;
+    if (state === "open" && needsResumeOnReopen) {
+      needsResumeOnReopen = false;
+      void reattachActiveSessionAfterReconnect();
     }
-    lastState = state;
   });
   bridge.unsubscribeAny = client.onAny((event) => {
     primarySubscriber(bridge)?.applyGatewayEvent(event);
   });
   bridge.unsubscribeDisconnect = client.on("gateway.disconnected", () => {
-    // Transient drop: keep the in-flight turn alive (don't freeze it as an
-    // error) so the reconnect handler above can recover it via session.resume.
+    // A disconnect that the transport could not silently recover. Keep the
+    // in-flight turn alive (don't freeze it as an error) and arm a one-shot
+    // session.resume for when the connection comes back.
+    needsResumeOnReopen = true;
     getDefaultStore().set(markStreamsReconnectingAtom);
   });
   gatewayBridge = bridge;
